@@ -2,7 +2,6 @@
 Script to generate synthetic samples using Hugging Face models and vLLM.
 This is part of the Polyglot project -> https://huggingface.co/Polygl0t
 """
-
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 import datasets
@@ -15,41 +14,48 @@ import glob
 import time
 import json
 import os
+from typing import List, Dict, Any, Optional, Tuple
 
-def setup_triton_cache():
-    """
-    Setup Triton cache directory with proper permissions and cleanup
-    """
-    # This helps to avoid problems related to stale cache files when
-    # running multiple jobs on the same node.
+# Constants
+TRITON_CACHE_CLEANUP_AGE = 3600  # 1 hour in seconds
+VRAM_MB_TO_GB = 1024
+
+def setup_triton_cache() -> None:
+    """Setup Triton cache directory with proper permissions and cleanup"""
     cache_dir = os.environ.get('TRITON_CACHE_DIR', './.cache/triton_cache')
     slurm_job_id = os.environ.get('SLURM_JOB_ID', 'local')
     cuda_visible_device = os.environ.get('CUDA_VISIBLE_DEVICES', '0')
     rank_cache_dir = f"{cache_dir}/{slurm_job_id}/rank_{cuda_visible_device}"
+    
     print(rank_cache_dir)
     os.makedirs(rank_cache_dir, exist_ok=True)
     os.environ['TRITON_CACHE_DIR'] = rank_cache_dir
     
-    # Clean up any stale cache files
+    # Clean up stale cache files
+    cleanup_stale_cache_files(rank_cache_dir)
+
+def cleanup_stale_cache_files(cache_dir: str) -> None:
+    """Remove cache files older than specified age"""
     try:
-        for root, _, files in os.walk(rank_cache_dir):
+        current_time = time.time()
+        for root, _, files in os.walk(cache_dir):
             for file in files:
                 file_path = os.path.join(root, file)
                 try:
-                    # Remove files older than 1 hour
-                    if os.path.getmtime(file_path) < time.time() - 3600:
+                    if os.path.getmtime(file_path) < current_time - TRITON_CACHE_CLEANUP_AGE:
                         os.remove(file_path)
                 except (OSError, IOError):
-                    # Ignore errors when cleaning up
-                    pass
+                    pass  # Ignore errors when cleaning up
     except Exception:
         pass
 
-def load_model_and_tokenizer(model_name, cache_dir, tensor_parallel_size, gpu_memory_utilization):
-    """
-    Load the model and tokenizer from Hugging Face.
-    """
-
+def load_model_and_tokenizer(
+    model_name: str, 
+    cache_dir: str, 
+    tensor_parallel_size: int, 
+    gpu_memory_utilization: float
+) -> Tuple[AutoTokenizer, LLM]:
+    """Load the model and tokenizer from Hugging Face."""
     tokenizer = AutoTokenizer.from_pretrained(
         model_name, 
         use_fast=True,
@@ -66,23 +72,26 @@ def load_model_and_tokenizer(model_name, cache_dir, tensor_parallel_size, gpu_me
 
     return tokenizer, model
 
-def get_nvidia_smi_vram():
-    """
-    Get the current VRAM usage of NVIDIA GPUs.
-    """
+def get_nvidia_smi_vram() -> List[float]:
+    """Get the current VRAM usage of NVIDIA GPUs in GB."""
     try:
         result = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"]
         )
         vram_list = result.decode("utf-8").strip().split("\n")
-        # Returns list of used VRAM in MB for each GPU
-        return [float(v)/1024 for v in vram_list] # Convert MB to GB
-    except Exception as e:
-        return ["nvidia-smi error"]
+        return [float(v) / VRAM_MB_TO_GB for v in vram_list]
+    except Exception:
+        return [0.0]  # Return 0 instead of error string
 
-def generate_samples(model, tokenizer, input_string, system, enable_thinking, sampling_params):
+def generate_samples(
+    model: LLM, 
+    tokenizer: AutoTokenizer, 
+    input_string: str, 
+    system: str, 
+    enable_thinking: bool, 
+    sampling_params: SamplingParams
+) -> List[str]:
     """Generate text samples using the model."""
-
     raw_text = tokenizer.apply_chat_template(
         [
             {"role": "system", "content": system},
@@ -95,17 +104,22 @@ def generate_samples(model, tokenizer, input_string, system, enable_thinking, sa
 
     t0 = time.time()
     outputs = model.generate([raw_text], sampling_params, use_tqdm=False)
-    t1 = time.time()
+    elapsed_time = time.time() - t0
     
-    t = t1 - t0
     nvidia_smi_vram = get_nvidia_smi_vram()[0]
-    print(f"Time taken: {t:.2f} seconds | nvidia-smi VRAM: {nvidia_smi_vram:.2f} GB | Tokens generated: {len(tokenizer(outputs[0].outputs[0].text).input_ids)}")
+    tokens_generated = len(tokenizer(outputs[0].outputs[0].text).input_ids)
+    
+    print(f"[STATS] Time taken: {elapsed_time:.2f}s | VRAM: {nvidia_smi_vram:.2f} GB | Tokens: {tokens_generated}")
 
     return [output.outputs[0].text for output in outputs]
 
-def save_samples(instruction, samples, output_file, file_prefix):
+def save_samples(
+    instruction: str, 
+    samples: List[str], 
+    output_file: str, 
+    file_prefix: str
+) -> None:
     """Save generated samples to a file."""
-
     with open(output_file, "a", encoding="utf-8") as f:
         for idx, sample in enumerate(samples):
             json_line = json.dumps(
@@ -117,12 +131,153 @@ def save_samples(instruction, samples, output_file, file_prefix):
             )
             f.write(json_line + "\n")
 
-def main(args):
+def load_dataset_from_directory(dataset_path: str, cache_dir: str, seed: Optional[int]) -> Any:
+    """Load dataset from a directory of JSONL or Parquet files"""
+    dataset_files = glob.glob(os.path.join(dataset_path, "*.jsonl"))
+    dataset_type = "json"
+    
+    if not dataset_files:
+        dataset_files = glob.glob(os.path.join(dataset_path, "*.parquet"))
+        dataset_type = "parquet"
+        if not dataset_files:
+            raise ValueError(f"No JSONL or Parquet files found in {dataset_path}")
 
-    # Setup Triton cache.
+    dataset = datasets.load_dataset(
+        dataset_type,
+        data_files=dataset_files,
+        split='train',
+        num_proc=len(dataset_files),
+        cache_dir=cache_dir,
+    )
+
+    if seed is not None:
+        dataset = dataset.shuffle(seed=seed)
+    
+    return dataset
+
+def load_dataset_from_jsonl(dataset_path: str, seed: Optional[int]) -> List[Dict]:
+    """Load dataset from a single JSONL file"""
+    dataset = []
+    with open(dataset_path, "r") as f:
+        for line in f:
+            try:
+                dataset.append(json.loads(line))
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+    
+    if seed is not None:
+        random.seed(seed)
+        random.shuffle(dataset)
+    
+    return dataset
+
+def load_dataset_from_hf(
+    dataset_path: str, 
+    dataset_split: str, 
+    dataset_subset: Optional[str], 
+    cache_dir: str, 
+    seed: Optional[int]
+) -> Any:
+    """Load dataset from Hugging Face"""
+    load_args = {
+        "path": dataset_path,
+        "split": dataset_split,
+        "cache_dir": cache_dir,
+    }
+
+    if dataset_subset is not None:
+        load_args["name"] = dataset_subset
+
+    dataset = datasets.load_dataset(**load_args)
+
+    if seed is not None:
+        dataset = dataset.shuffle(seed=seed)
+    
+    return dataset
+
+def load_dataset(args: argparse.Namespace) -> Any:
+    """Load dataset based on the provided path"""
+    if os.path.isdir(args.dataset_path):
+        return load_dataset_from_directory(args.dataset_path, args.cache_dir, args.seed)
+    elif args.dataset_path.endswith(".jsonl"):
+        return load_dataset_from_jsonl(args.dataset_path, args.seed)
+    else:
+        return load_dataset_from_hf(
+            args.dataset_path, 
+            args.dataset_split, 
+            args.dataset_subset, 
+            args.cache_dir, 
+            args.seed
+        )
+
+def get_starting_row(file_path: str, row_start: Optional[int]) -> int:
+    """Determine the starting row for processing"""
+    if row_start is not None:
+        return row_start
+    
+    if not os.path.exists(file_path):
+        return 0
+    
+    max_idx = 0
+    with open(file_path, "r") as f:
+        for line in f:
+            try:
+                json_object = json.loads(line)
+                idx_value = int(json_object['idx'].split("_")[1])
+                max_idx = max(max_idx, idx_value)
+            except (json.JSONDecodeError, KeyError, ValueError, IndexError):
+                continue
+    
+    return max_idx + 1
+
+def process_sample(
+    sample: Dict[str, Any],
+    counter: int,
+    args: argparse.Namespace,
+    model: LLM,
+    tokenizer: AutoTokenizer,
+    sampling_params: SamplingParams,
+    system_prompt: str,
+    file_path: str
+) -> None:
+    """Process a single sample from the dataset"""
+    text_content = sample[args.column_name]
+    token_count = len(tokenizer(text_content).input_ids)
+
+    # Skip if token count exceeds max chunk size
+    if token_count > args.max_chunk_size:
+        print(f"[SKIP] Row {counter} with {token_count} tokens (exceeds max chunk size of {args.max_chunk_size} tokens).")
+        return
+
+    # Build full prompt
+    full_prompt = f"{args.prompt_prefix}{text_content}{args.prompt_suffix}"
+
+    print(f"[GENERATING] Samples for row {counter}.")
+    
+    # Generate
+    generated_samples = generate_samples(
+        model=model, 
+        tokenizer=tokenizer,
+        input_string=full_prompt,
+        system=system_prompt,
+        enable_thinking=args.enable_thinking,
+        sampling_params=sampling_params,
+    )
+
+    # Save
+    save_samples(
+        instruction=text_content,
+        samples=generated_samples,
+        output_file=file_path, 
+        file_prefix=f"row_{counter}",
+    )
+
+def main(args: argparse.Namespace) -> None:
+    """Main execution function"""
+    # Setup
     setup_triton_cache()
 
-    # Load model and tokenizer.
+    # Load model and tokenizer
     tokenizer, model = load_model_and_tokenizer(
         args.model_name, 
         args.cache_dir, 
@@ -130,9 +285,9 @@ def main(args):
         args.gpu_memory_utilization
     )
 
-    # Define sampling parameters.
+    # Define sampling parameters
     sampling_params = SamplingParams(
-        max_tokens =args.max_length,
+        max_tokens=args.max_length,
         stop=[tokenizer.eos_token],
         stop_token_ids=[tokenizer.eos_token_id],
         n=args.num_return_sequences,
@@ -144,126 +299,51 @@ def main(args):
 
     # Read the Constitution file
     with open(args.constitution_file, "r") as f:
-        SYSTEM = f.read()
+        system_prompt = f.read()
 
-    # Print the Constitution
-    print("### Constitution ###")
-    print(SYSTEM)
-    print("#####################")
+    print("#" * 50)
+    print("[INFO] Used Constitution:")
+    print(system_prompt)
+    print("#" * 50)
 
-    # Create output directory if it doesn't exist.
+    # Setup output
     os.makedirs(args.output_dir, exist_ok=True)
-
-    # Create output file path.
     file_path = os.path.join(args.output_dir, args.output_file)
 
-    # Initialize output file if it doesn't exist.
+    # Determine starting row
+    row_start = get_starting_row(file_path, args.row_start)
+
+    # Initialize output file if needed
     if not os.path.exists(file_path):
-        with open(file_path, "w") as f:
-            f.write("")
-        args.row_start = args.row_start or 0
-    else:
-        # If output file exists, we set row_start based on existing content,
-        # unless row_start is already set.
-        if args.row_start is None:
-            args.row_start = 0
-            with open(file_path, "r") as f:
-                for line in f:
-                    try:
-                        json_object = json.loads(line)
-                        idx_value = int(json_object['idx'].split("_")[1])
-                        args.row_start = max(args.row_start, idx_value)
-                    except (json.JSONDecodeError, KeyError, ValueError):
-                        continue
-            args.row_start += 1  # Start from the next unprocessed row
+        open(file_path, "w").close()
 
-    print("Generator: ", args.model_name)
-    print("Dataset: ", args.dataset_path)    
-    print("Starting from row: ", args.row_start)
+    print("[INFO] Starting synthesis process...")
+    print(f"[INFO] Generator: {args.model_name}")
+    print(f"[INFO] Dataset: {args.dataset_path}")
+    print(f"[INFO] Starting from row: {row_start}")
 
-    # Load dataset.
-    # Dataset can either be a directory of JSONL/Parquet files;
-    if os.path.isdir(args.dataset_path):
-        dataset_files = glob.glob(os.path.join(args.dataset_path, "*.jsonl"))
-        dataset_type = "json"
-        if not dataset_files:
-            dataset_files = glob.glob(os.path.join(args.dataset_path, "*.parquet"))
-            dataset_type = "parquet"
-            if not dataset_files:
-                raise ValueError(f"No JSONL or Parquet files found in {args.dataset_path}")
+    # Load dataset
+    dataset = load_dataset(args)
+    print(f"[INFO] Loaded dataset with {len(dataset)} samples.")
 
-        dataset = datasets.load_dataset(
-            dataset_type,
-            data_files=dataset_files,
-            split='train',
-            num_proc=len(dataset_files),
-            cache_dir=args.cache_dir,
-        )
-
-    # Or a standard HF dataset.
-    else:
-        load_args = {
-            "path": args.dataset_path,
-            "split": args.dataset_split,
-            "cache_dir": args.cache_dir,
-        }
-
-        if args.dataset_subset is not None:
-            load_args["name"] = args.dataset_subset
-
-        dataset = datasets.load_dataset(**load_args)
-            
-    print(f"### Loaded dataset with {len(dataset)} samples.")
-
-    # Iterate through the dataset and process each sample.
+    # Process each sample
     for counter, sample in enumerate(dataset):
-
-        # Skip processed rows.
-        if counter < args.row_start:
+        if counter < row_start:
             continue
-
-        # Count the number of tokens in the input text.
-        token_count = len(tokenizer(sample[args.column_name]).input_ids)
-
-        # Skip if token count exceeds max chunk size.
-        if token_count > args.max_chunk_size:
-            print(f"Skipping row {counter} with {token_count} tokens (exceeds max chunk size of {args.max_chunk_size} tokens).")
-            continue
-
-        # Build full prompt.
-        full_prompt = f"{args.prompt_prefix}{sample[args.column_name]}{args.prompt_suffix}"
-
-        print(f"Generating samples for row {counter}.")
         
-        # Generate.
-        generated_samples = generate_samples(
-            model=model, 
-            tokenizer=tokenizer,
-            input_string=full_prompt,
-            system=SYSTEM,
-            enable_thinking=args.enable_thinking,
-            sampling_params=sampling_params,
-        )
-
-        # Save.
-        save_samples(
-            instruction=sample[args.column_name],
-            samples=generated_samples,
-            output_file=file_path, 
-            file_prefix=f"row_{counter}",
-        )
+        process_sample(sample, counter, args, model, tokenizer, sampling_params, system_prompt, file_path)
         
-    print("Iteration completed.")
+    print("[INFO] Iteration completed.")
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Generate synthetic samples using a Hugging Face models and vLLM.")
     parser.add_argument("--model_name", type=str, required=True, help="Hugging Face model name.")
     parser.add_argument("--tensor_parallel_size", type=int, default=1, help="Tensor parallel size for model loading.")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization for model loading.")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to the dataset.")
     parser.add_argument("--dataset_subset", type=str, default=None, help="Subset of the dataset to use.")
     parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split to use.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed. If set to an integer, the dataset will be shuffled.")
     parser.add_argument("--column_name", type=str, required=True, help="Column in the dataset where the query/prompt is located.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the generated samples.")
     parser.add_argument("--output_file", type=str, default="output.jsonl", help="Output file name.")
@@ -283,4 +363,7 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
+    print("Starting synthesis! 🚀")
     main(args)
+    print("Synthesis completed successfully! 🎉")
+
